@@ -1,14 +1,17 @@
 {
 	"luci-app-filebrowser": {
-		"description": "Grant access to File Browser",
-		"write": {
-			"cgi-io": [ "upload", "download" ],
+		"description": "Grant UCI access for luci-app-filebrowser",
+		"read": {
 			"ubus": {
-				"file": [ "*" ]
+				"luci.filebrowser": [ "status" ]
 			},
+			"uci": [ "filebrowser" ],
 			"file": {
-				"/*": [  "list", "read", "write" ]
+				"/var/log/filebrowser.log": [ "read" ]
 			}
+		},
+		"write": {
+			"uci": [ "filebrowser" ]
 		}
 	}
 }
