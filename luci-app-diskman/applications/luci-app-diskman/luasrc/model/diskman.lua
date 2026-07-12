@@ -14,138 +14,6 @@ for _, cmd in ipairs(CMD) do
     d.command[cmd] = command:match("^.+"..cmd) or nil
 end
 
-local function sysfs_transport(device)
-  local path = (luci.util.exec("readlink -f /sys/class/block/" .. device .. "/device 2>/dev/null") or ""):match("%S+")
-  if not path then
-    return nil
-  end
-
-  local seen = {}
-  local parent = path
-  while parent and parent ~= "/" do
-    local subsystem = (luci.util.exec("readlink -f " .. parent .. "/subsystem 2>/dev/null") or ""):match("([^/]+)$")
-    if subsystem then
-      seen[subsystem] = true
-    end
-    parent = parent:match("^(.*)/[^/]+$")
-  end
-
-  if seen.usb then
-    return "usb"
-  elseif seen.nvme then
-    return "nvme"
-  elseif seen.ata then
-    return "ata"
-  elseif seen.scsi then
-    return "scsi"
-  end
-
-  return nil
-end
-
-local function udevadm_transport(device)
-  if luci.sys.exec("which udevadm") == "" then
-    return nil
-  end
-
-  local cmd = io.popen("udevadm info --query=property --name=/dev/" .. device .. " 2>/dev/null")
-  if not cmd then
-    return nil
-  end
-
-  local transport
-  for line in cmd:lines() do
-    local key, value = line:match("^(%S+)=(.*)$")
-    if key == "ID_BUS" and value and value ~= "" then
-      transport = value
-      break
-    end
-  end
-  cmd:close()
-
-  return transport
-end
-
-local function lsblk_transport(device)
-  if not d.command.lsblk then
-    return nil
-  end
-
-  local transport = (luci.util.exec(d.command.lsblk .. " -dn -o TRAN /dev/" .. device .. " 2>/dev/null") or ""):match("(%S+)")
-  if transport and transport ~= "-" then
-    return transport
-  end
-
-  return nil
-end
-
-local function device_transport(device)
-  return lsblk_transport(device) or udevadm_transport(device) or sysfs_transport(device)
-end
-
-local function smartctl_candidates(device)
-  local transport = device_transport(device)
-  if device:match("^nvme%d+n%d+") or device:match("^nvme%d+$") or transport == "nvme" then
-    return { "nvme", "" }
-  end
-  if transport == "usb" then
-    return { "sat", "scsi", "" }
-  end
-
-  return { "", "sat", "scsi" }
-end
-
-local function run_smartctl(device, devtype, options)
-  if not d.command.smartctl then
-    return ""
-  end
-
-  local cmd = d.command.smartctl
-  if devtype and devtype ~= "" then
-    cmd = cmd .. " -d " .. devtype
-  end
-  if options and options ~= "" then
-    cmd = cmd .. " " .. options
-  end
-  cmd = cmd .. " /dev/" .. device .. " 2>&1"
-
-  local pipe = io.popen(cmd)
-  if not pipe then
-    return ""
-  end
-
-  local output = pipe:read("*all") or ""
-  pipe:close()
-  return output
-end
-
-local function smartctl_success(output)
-  return output:match("START OF SMART DATA SECTION")
-    or output:match("START OF READ SMART DATA SECTION")
-    or output:match("NVMe Version:")
-    or output:match("SMART Health Status:")
-    or output:match("Device is in [A-Z]+ mode")
-end
-
-local function smartctl_output(device, options)
-  options = options or ""
-  local fallback
-
-  for _, devtype in ipairs(smartctl_candidates(device)) do
-    local output = run_smartctl(device, devtype, options)
-    if output ~= "" then
-      fallback = fallback or output
-      if smartctl_success(output) then
-        return output
-      end
-    end
-  end
-
-  return fallback or ""
-end
-
-d.smartctl_output = smartctl_output
-
 d.command.mount = nixio.fs.access("/usr/bin/mount") and "/usr/bin/mount" or "/bin/mount"
 d.command.umount = nixio.fs.access("/usr/bin/umount") and "/usr/bin/umount" or "/bin/umount"
 
@@ -168,32 +36,16 @@ end
 local get_smart_info = function(device)
   local section
   local smart_info = {}
-  for line in (d.smartctl_output(device, "-H -A -i -n standby -f brief") or ""):gmatch("[^\r\n]+") do
+  for _, line in ipairs(luci.util.execl(d.command.smartctl .. " -H -A -i -n standby -f brief /dev/" .. device)) do
     local attrib, val
-    if not smart_info.health then
-      smart_info.health = line:match(".-overall%-health.-: (.+)")
-        or line:match("^SMART Health Status:%s*(.+)")
-    end
-    if not smart_info.temp then
-      local temp_id, temp_name, temp_raw
-      temp_id, temp_name, temp_raw = line:match("^%s*(%d+)%s+([%w_%-]+).-%s+([0-9]+)%s*%(")
-      if temp_id and (temp_id == "194" or temp_id == "190")
-        and (temp_name == "Temperature_Celsius" or temp_name == "Temperature" or temp_name == "Airflow_Temperature_Cel") then
-        smart_info.temp = temp_raw .. "°C"
-      else
-        temp_id, temp_name, temp_raw = line:match("^%s*(%d+)%s+([%w_%-]+).-%s+([0-9]+)%s*$")
-        if temp_id and (temp_id == "194" or temp_id == "190")
-          and (temp_name == "Temperature_Celsius" or temp_name == "Temperature" or temp_name == "Airflow_Temperature_Cel") then
-          smart_info.temp = temp_raw .. "°C"
-        end
-      end
-    end
     if section == 1 then
         attrib, val = line:match "^(.-):%s+(.+)"
-    elseif section == 2 and smart_info.nvme_ver then
+    elseif section == 2 and device:match("nvme") then
       attrib, val = line:match("^(.-):%s+(.+)")
+      if not smart_info.health then smart_info.health = line:match(".-overall%-health.-: (.+)") end
     elseif section == 2 then
       attrib, val = line:match("^([0-9 ]+)%s+[^ ]+%s+[POSRCK-]+%s+[0-9-]+%s+[0-9-]+%s+[0-9-]+%s+[0-9-]+%s+([0-9-]+)")
+      if not smart_info.health then smart_info.health = line:match(".-overall%-health.-: (.+)") end
     else
       attrib = line:match "^=== START OF (.*) SECTION ==="
       if attrib and attrib:match("INFORMATION") then
@@ -221,20 +73,12 @@ local get_smart_info = function(device)
     --   smart_info.logic_sec = smart_info.phy_sec
     elseif attrib == "Serial Number" then
       smart_info.sn = val
-    elseif attrib == "194" or attrib == "Temperature_Celsius" or attrib == "Temperature" then
-      if val ~= "-" then
-        smart_info.temp = (val:match("(%d+)") or "?") .. "°C"
-      end
-    elseif attrib == "190" or attrib == "Airflow_Temperature_Cel" then
-      if val ~= "-" then
-        smart_info.temp = (val:match("(%d+)") or "?") .. "°C"
-      end
+    elseif attrib == "194" or attrib == "Temperature" then
+      smart_info.temp = val:match("(%d+)") .. "°C"
     elseif attrib == "Rotation Rate" then
       smart_info.rota_rate = val
     elseif attrib == "SATA Version is" then
       smart_info.sata_ver = val
-    elseif attrib == "NVMe Version" then
-      smart_info.nvme_ver = val
     end
   end
   return smart_info
@@ -335,13 +179,13 @@ local get_parted_info = function(device)
         partition_temp["number"] = -1
         partition_temp["fs"] = "Free Space"
         partition_temp["name"] = "-"
-      elseif device:match("sd") or device:match("sata") or device:match("vd") then
+      elseif device:match("sd") or device:match("sata") then
         partition_temp["name"] = device..partition_temp["number"]
       elseif device:match("mmcblk") or device:match("md") or device:match("nvme") then
         partition_temp["name"] = device.."p"..partition_temp["number"]
       end
       if partition_temp["number"] > 0 and partition_temp["fs"] == "" and d.command.lsblk then
-        partition_temp["fs"] = (luci.util.exec(d.command.lsblk .. " /dev/" .. partition_temp["name"] .. " -no fstype") or ""):match("([^%s]+)") or ""
+        partition_temp["fs"] = luci.util.exec(d.command.lsblk .. " /dev/"..device.. tostring(partition_temp["number"]) .. " -no fstype"):match("([^%s]+)") or ""
       end
       partition_temp["fs"] = partition_temp["fs"] == "" and "raw" or partition_temp["fs"]
       partition_temp["sec_start"] = partition_temp["sec_start"] and partition_temp["sec_start"]:sub(1,-2)
@@ -379,10 +223,10 @@ local get_parted_info = function(device)
           p["type"] = "logical"
           table.insert(partitions_temp[disk_temp["extended_partition_index"]]["logicals"], i)
         end
-      elseif (p["number"] <= 4) and (p["number"] > 0) then
+      elseif (p["number"] < 4) and (p["number"] > 0) then
         local s = nixio.fs.readfile("/sys/block/"..device.."/"..p["name"].."/size")
         if s then
-          local real_size_sec = tonumber(s) * tonumber(disk_temp.logic_sec)
+          local real_size_sec = tonumber(s) * tonumber(disk_temp.phy_sec)
           -- if size not equal, it's an extended
           if real_size_sec ~= p["size"] then
             disk_temp["extended_partition_index"] = i
@@ -400,7 +244,7 @@ local get_parted_info = function(device)
       end
     end
   end
-  result = disk_temp or result
+  result = disk_temp
   result.partitions = partitions_temp
 
   return result
@@ -467,7 +311,7 @@ d.get_disk_info = function(device, wakeup)
     disk_info = get_parted_info(device)
     disk_info["sec_size"] = disk_info["logic_sec"] .. "/" .. disk_info["phy_sec"]
     disk_info["size_formated"] = byte_format(tonumber(disk_info["size"]))
-    -- if status is standby, after get part info, the disk is weakuped, then get smart_info again for more informations
+    -- if status is standby, then get smart_info again
     if smart_info.status ~= "ACTIVE" then smart_info = get_smart_info(device) end
   else
     disk_info = {}
@@ -559,7 +403,6 @@ d.list_devices = function()
       or dev:match("^mmcblk%d+$")
       or dev:match("^sata[a-z]$")
       or dev:match("^nvme%d+n%d+$")
-      or dev:match("^vd[a-z]$")
       then
       table.insert(target_devnames, dev)
     end
@@ -612,10 +455,10 @@ d.get_format_cmd = function()
     ext2 = { cmd = "mkfs.ext2", option = "-F -E lazy_itable_init=1" },
     ext3 = { cmd = "mkfs.ext3", option = "-F -E lazy_itable_init=1" },
     ext4 = { cmd = "mkfs.ext4", option = "-F -E lazy_itable_init=1" },
-    fat32 = { cmd = "mkfs.fat", option = "-F 32" },
-    exfat = { cmd = "mkfs.exfat", option = "" },
+    fat32 = { cmd = "mkfs.vfat", option = "-F" },
+    exfat = { cmd = "mkexfat", option = "-f" },
     hfsplus = { cmd = "mkhfs", option = "-f" },
-    ntfs = { cmd = "mkfs.ntfs", option = "-f" },
+    ntfs = { cmd = "mkntfs", option = "-f" },
     swap = { cmd = "mkswap", option = "" },
     btrfs = { cmd = "mkfs.btrfs", option = "-f" }
   }
@@ -627,18 +470,6 @@ d.get_format_cmd = function()
     end
   end
   return result
-end
-
-d.find_free_md_device = function()
-  for num=0,127 do
-    local md = io.open("/dev/md"..tostring(num), "r")
-    if md == nil then
-      return "/dev/md"..tostring(num)
-    else
-      io.close(md)
-    end
-  end
-  return nil
 end
 
 d.create_raid = function(rname, rlevel, rmembers)
@@ -661,8 +492,18 @@ d.create_raid = function(rname, rlevel, rmembers)
       return "ERR: Invalid raid name"
     end
   else
-    rname = d.find_free_md_device()
-    if rname == nil then return "ERR: Cannot find free md device" end
+    local mdnum = 0
+    for num=1,127 do
+      local md = io.open("/dev/md"..tostring(num), "r")
+      if md == nil then
+        mdnum = num
+        break
+      else
+        io.close(md)
+      end
+    end
+    if mdnum == 0 then return "ERR: Cannot find proper md number" end
+    rname = "/dev/md"..mdnum
   end
 
   if rlevel == "5" or rlevel == "6" then

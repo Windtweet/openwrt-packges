@@ -21,96 +21,261 @@ module YAML
 		puts Time.new.strftime("%Y-%m-%d %H:%M:%S") + " [Tip] " + "#{info}"
 	end
 
-	# Keep `short-id` as string before YAML parsing so leading zeros are preserved.
-	# This is required for REALITY short-id values like `00000000`.
 	def self.load_file(filename, *args, **kwargs)
-		yaml_content = File.read(filename)
-		processed_content = fix_short_id_quotes(yaml_content)
+		yaml_content = File.read(filename, mode: "r:bom|utf-8")
 
-		if kwargs.empty?
-			load(processed_content, *args)
-		else
-			load(processed_content, *args, **kwargs)
+		secret = nil
+		if kwargs.key?(:secret)
+			secret = kwargs.delete(:secret)
 		end
+
+		if secret && secret.to_s.strip != "" && yaml_content.include?("BEGIN AGE ENCRYPTED FILE")
+			begin
+				decrypted = decrypt_content_with_secret(secret.to_s, yaml_content)
+				if decrypted && !decrypted.empty? && !decrypted.include?("BEGIN AGE ENCRYPTED FILE")
+					processed = fix_short_id_quotes(decrypted)
+					return load(processed, *args, **kwargs)
+				else
+					LOG_WARN("【%s】Decrypted content empty or still encrypted" % [filename])
+				end
+			rescue => e
+				LOG_WARN("Decrypt attempt failed:【%s】" % [e.message])
+			end
+		end
+
+		if (secret.nil? || secret.to_s.strip == "") && yaml_content.include?("BEGIN AGE ENCRYPTED FILE")
+			keys = find_age_keys_for_filename(filename)
+			(keys[:secrets] || []).each do |sec|
+				begin
+					decrypted = decrypt_content_with_secret(sec, yaml_content)
+					if decrypted && !decrypted.empty? && !decrypted.include?("BEGIN AGE ENCRYPTED FILE")
+						processed = fix_short_id_quotes(decrypted)
+						return load(processed, *args, **kwargs)
+					end
+				rescue => e
+					LOG_WARN("Decrypt attempt failed for a found secret:【%s】" % [e.message])
+				end
+			end
+		end
+
+		if yaml_content.include?("BEGIN AGE ENCRYPTED FILE")
+			raise "Encrypted file: decryption failed for %s" % [filename]
+		end
+
+		processed_content = fix_short_id_quotes(yaml_content)
+		load(processed_content, *args, **kwargs)
 	end
 
 	def self.dump(obj, io = nil, **options)
 		begin
-		if io.nil?
 			yaml_content = original_dump(obj, **options)
-			fix_short_id_quotes(yaml_content)
-		elsif io.respond_to?(:write)
-			require 'stringio'
-			temp_io = StringIO.new
-			original_dump(obj, temp_io, **options)
-			yaml_content = temp_io.string
-			processed_content = fix_short_id_quotes(yaml_content)
-			io.write(processed_content)
-			io
-		else
-			yaml_content = original_dump(obj, io, **options)
-			fix_short_id_quotes(yaml_content)
-		end
+			processed = fix_short_id_quotes(yaml_content)
+			public_key = nil
+			fname = nil
+			if options.key?(:public)
+				public_key = options.delete(:public)
+			end
+
+			if (!public_key || public_key.to_s.strip == "")
+				if options.key?(:filename)
+					fname = options.delete(:filename)
+				elsif io && io.respond_to?(:path)
+					fname = io.path
+				elsif io && io.respond_to?(:to_path)
+					fname = io.to_path
+				end
+
+				if fname && fname.to_s.strip != ""
+				keys = find_age_keys_for_filename(fname)
+				public_key = keys[:publics].first if keys[:publics] && !keys[:publics].empty?
+				end
+			end
+
+			if public_key && public_key.to_s.strip != ""
+				begin
+					encrypted = encrypt_content_with_public(public_key.to_s, processed)
+					if encrypted && !encrypted.empty?
+						if io.nil?
+							return encrypted
+						elsif io.respond_to?(:write)
+							io.write(encrypted)
+							return io
+						else
+							return encrypted
+						end
+					end
+				rescue => e
+					LOG_WARN("Encrypt attempt failed:【%s】" % [e.message])
+				end
+			end
+
+			if io.nil?
+				processed
+			elsif io.respond_to?(:write)
+				io.write(processed)
+				io
+			else
+				processed
+			end
 		rescue => e
 			LOG_ERROR("Write file failed:【%s】" % [e.message])
 			nil
 		end
 	end
 
+	def self.popen_stream(cmd, input, chunk_size: 64 * 1024)
+		output = String.new
+		IO.popen(cmd, 'r+', err: [:child, :out]) do |io|
+			io.binmode
+			writer = Thread.new do
+				begin
+				input.bytesize.times do |i|
+					chunk = input.byteslice(i * chunk_size, chunk_size)
+					break if chunk.nil?
+					io.write(chunk)
+				end
+				io.close_write
+				rescue Errno::EPIPE
+				end
+			end
+
+			while chunk = io.read(chunk_size)
+				output << chunk
+			end
+			writer.join
+		end
+		[output, $?]
+	end
+
+	def self.decode64(input)
+		out, status = popen_stream(["base64", "-d"], input)
+		status.success? ? out : input
+	rescue Errno::ENOENT
+		input
+	end
+
+	def self.find_age_keys_for_filename(filename)
+		begin
+			basename = File.basename(filename)
+			basename_no_ext = File.basename(filename, File.extname(filename))
+			publics = []
+			secrets = []
+
+			[basename, basename_no_ext].uniq.each do |n|
+				cmd_public = ["/bin/sh", "-c", ". /usr/share/openclash/uci.sh; uci_get_age_public_keys \"$1\"", "sh", n]
+				IO.popen(cmd_public, "r") do |io|
+					io.each_line { |l| publics << l.strip unless l.nil? || l.strip == "" }
+				end
+
+				cmd_secret = ["/bin/sh", "-c", ". /usr/share/openclash/uci.sh; uci_get_age_secret_keys \"$1\"", "sh", n]
+				IO.popen(cmd_secret, "r") do |io|
+					io.each_line { |l| secrets << l.strip unless l.nil? || l.strip == "" }
+				end
+			end
+			{ publics: publics, secrets: secrets }
+		rescue => e
+			{ publics: [], secrets: [] }
+		end
+	end
+
+	def self.decrypt_content_with_secret(secret, content)
+		cmd = ['/etc/openclash/core/clash_meta', 'age', 'decrypt', secret, '-', '-']
+		out, status = popen_stream(cmd, content)
+		status.success? ? out : nil
+	rescue => e
+		nil
+	end
+
+	def self.encrypt_content_with_public(public, content)
+		cmd = ['/etc/openclash/core/clash_meta', 'age', 'encrypt', public, '-', '-']
+		out, status = popen_stream(cmd, content)
+		status.success? ? out : nil
+	rescue => e
+		nil
+	end
+
 	private
 
-	SHORT_ID_REGEX = /^(\s*)short-id:\s*(.*)$/
-	LIST_ITEM_REGEX = /^(\s*)-\s*(.*)$/
-	KEY_REGEX = /^(\s*)([a-zA-Z0-9_-]+):\s*(.*)$/
-	QUOTED_VALUE_REGEX = /^(["'].*["']|null)$/
-
-	# Inline map support, e.g. reality-opts: { ..., short-id: 00000000 }
-	INLINE_SHORT_ID_REGEX = /(short-id:\s*)(?!["'\[]|null)([^\s,"'{}\[\]\n\r]+)(?=\s*(?:[,}\]\n\r]|$))/m.freeze
+	# fix_short_id_quotes:
+	# Purpose: ensure YAML `short-id` values are emitted with the intended
+	# representation when dumping or re-writing YAML files.
+	# Behavior:
+	# - Non-null, non-empty scalar `short-id` values (and items inside
+	#   `short-id` sequences) are written as double-quoted strings.
+	# - Empty strings are preserved as empty quoted strings ("" remains "").
+	# - Null values are preserved and may be emitted explicitly (e.g. `! "").
+	# Lastly, use gsub to clean up any `! ""` tags
+	# Examples:
+	#   Input:  short-id: 00000000    -> Output: short-id: "00000000"
+	#   Input:  short-id: ""          -> Output: short-id: ""
+	#   Input:  short-id: "abc123"    -> Output: short-id: "abc123"
+	#   Input:  short-id: "1600e237"  -> Output: short-id: "1600e237"
+	#   Input:  short-id: null        -> Output: short-id: ""
 
 	def self.fix_short_id_quotes(yaml_content)
+		yaml_content = decode64(yaml_content)
+
 		return yaml_content unless yaml_content.include?('short-id:')
 
 		begin
-			# First, normalize inline-map style unquoted short-id.
-			processed = yaml_content.gsub(INLINE_SHORT_ID_REGEX) do
-				"#{$1}\"#{$2}\""
-			end
+			stream = Psych.parse_stream(yaml_content)
 
-			lines = processed.lines
-			short_id_indices = lines.each_index.select { |i| lines[i] =~ SHORT_ID_REGEX }
-			short_id_indices.each do |short_id_index|
-				line = lines[short_id_index]
-				if line =~ SHORT_ID_REGEX
-					indent = $1
-					value = $2.strip
-					if value.empty?
-						(short_id_index + 1...lines.size).each do |i|
-							line = lines[i]
-							next if line.strip.empty?
-							if line[/^\s*/].length <= indent.length
-								break
-							end
-							if line =~ LIST_ITEM_REGEX
-								indent = $1
-								value = $2.strip
-								if value =~ KEY_REGEX
-									break
+			traverse = lambda do |node|
+				case node
+				when Psych::Nodes::Mapping
+					children = node.children || []
+					i = 0
+					while i < children.length
+						key = children[i]
+						val = children[i + 1]
+						if key.is_a?(Psych::Nodes::Scalar) && key.value == 'short-id'
+							if val.is_a?(Psych::Nodes::Scalar)
+								is_null_scalar = (val.tag == 'tag:yaml.org,2002:null') || (val.tag == '!!null') || (val.value =~ /^\s*(~|null|NULL|Null)\s*$/)
+								unless is_null_scalar
+									val.tag = nil
+									val.style = defined?(Psych::Nodes::Scalar::DOUBLE_QUOTED) ? Psych::Nodes::Scalar::DOUBLE_QUOTED : 2
 								end
-								if value !~ QUOTED_VALUE_REGEX
-									lines[i] = "#{indent}- \"#{value}\"\n"
+							elsif val.is_a?(Psych::Nodes::Sequence)
+								val.children.each do |child|
+									if child.is_a?(Psych::Nodes::Scalar)
+										is_null_child = (child.tag == 'tag:yaml.org,2002:null') || (child.tag == '!!null') || (child.value =~ /^\s*(~|null|NULL|Null)\s*$/)
+										unless is_null_child
+											child.tag = nil
+											child.style = defined?(Psych::Nodes::Scalar::DOUBLE_QUOTED) ? Psych::Nodes::Scalar::DOUBLE_QUOTED : 2
+										end
+									end
 								end
-							elsif line =~ KEY_REGEX
-								break
 							end
+						else
+							traverse.call(key) if key.respond_to?(:children)
+							traverse.call(val) if val.respond_to?(:children)
 						end
-					else
-						if value !~ QUOTED_VALUE_REGEX
-							lines[short_id_index] = "#{indent}short-id: \"#{value}\"\n"
-						end
+						i += 2
+					end
+				when Psych::Nodes::Sequence
+					(node.children || []).each { |c| traverse.call(c) }
+				when Psych::Nodes::Document, Psych::Nodes::Stream
+					(node.children || []).each { |c| traverse.call(c) }
+				else
+					if node.respond_to?(:children)
+						(node.children || []).each { |c| traverse.call(c) }
 					end
 				end
 			end
-			lines.join
+
+			stream.children.each do |doc_node|
+				if doc_node.is_a?(Psych::Nodes::Document)
+					traverse.call(doc_node.root) if doc_node.root
+				end
+			end
+
+			if stream.respond_to?(:to_yaml)
+				processed_yaml = stream.to_yaml
+				processed_yaml = processed_yaml.gsub(/^([ \t]*short-id:\s*)!\s*/, "\\1")
+				processed_yaml
+			else
+				yaml_content
+			end
 		rescue => e
 			LOG_ERROR("Fix short-id values type failed:【%s】" % [e.message])
 			yaml_content

@@ -31,85 +31,6 @@ end
 
 -- disks
 local disks = dm.list_devices()
-
--- ==================== eMMC 优化显示补丁开始 ====================
-if disks then
-  for dev, info in pairs(disks) do
---    if dev:match("^mmcblk") then
-      -- 1. 优化显示 eMMC 型号 (Model)
-      if not info.model or info.model == "" or info.model == "-" then
-        local name = luci.util.exec("cat /sys/block/" .. dev .. "/device/name 2>/dev/null"):gsub("%s+", "")
-        local type_str = luci.util.exec("cat /sys/block/" .. dev .. "/device/type 2>/dev/null"):gsub("%s+", "")
-        if name ~= "" then
-          info.model = (type_str ~= "" and type_str or "eMMC") .. " " .. name
-        else
-          info.model = "eMMC Flash Drive"
-        end
-      end
-
-      -- 2. 优化显示序列号 (Serial Number)
-      if not info.sn or info.sn == "" or info.sn == "-" then
-        local serial = luci.util.exec("cat /sys/block/" .. dev .. "/device/serial 2>/dev/null"):gsub("%s+", "")
-        if serial ~= "" then info.sn = serial end
-      end
-
-      -- 3. 优化显示温度 (Temp)
-      if dev:match("^mmcblk") or (not string.match(info.model,"USB")) then
-      if not info.temp or info.temp == "" or info.temp == "-" then
-        local thermal = luci.util.exec("cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null")
-        if thermal and thermal ~= "" then
-          local t = tonumber(thermal)
-          info.temp = t and string.format("%.1f °C", t / 1000) or "N/A"
-        else
-          info.temp = "N/A"
-        end
-      end
-      end
-      -- 4. 优化显示健康状态 (Health Status)
-      if not info.health_status or info.health_status == "" or info.health_status == "-" then
-        local life = luci.util.exec("cat /sys/block/" .. dev .. "/device/life_time 2>/dev/null"):gsub("[\r\n]", "")
-        local eol = luci.util.exec("cat /sys/block/" .. dev .. "/device/pre_eol_info 2>/dev/null"):gsub("%s+", "")
-        
-        local status = "Normal"
-        if eol == "0x02" or eol == "2" then
-          status = "Warning (Consuming)"
-        elseif eol == "0x03" or eol == "3" then
-          status = "Urgent (Replace)"
-        end
-        
-        if life ~= "" then
-          local ta, tb = life:match("([0x%x]+)%s+([0x%x]+)")
-          if ta and tb then
-            local a_pct = (tonumber(ta) or 0) * 10
-           -- local b_pct = (tonumber(tb) or 0) * 10
-           -- status = string.format("%s (Est. Used A:%d%%, B:%d%%)", status, a_pct > 100 and 100 or a_pct, b_pct > 100 and 100 or b_pct)
-            status = string.format("%s (Used A:%d%%)", status, a_pct > 100 and 100 or a_pct)
-	   end
-        end
-        info.health_status = status
-      end
-
-    -- 5. 补全分区表类型显示
-    -- if not info.p_table or info.p_table == "" or info.p_table == "-" then
-    --   info.p_table = "N/A"
-    --  end
-      if not info.p_table or info.p_table == "" or info.p_table == "-" then
-        local handle = io.popen("parted /dev/" .. dev .. " print 2>/dev/null | grep 'Partition Table'")
-        local result = handle:read("*l")
-        handle:close()
-            if result then
-                local ptype = result:match("Partition Table: (%S+)")
-      --        local pTable = luci.util.exec("cat /sys/block/" .. dev .. "/device/life_time 2>/dev/null"):gsub("[\r\n]", "")
-                info.p_table = ptype
-            end
-      end
-      -- 6. EMMC没有sata信息
-      if dev:match("^mmcblk") or string.match(info.model,"USB") then
-        info.sata_ver = "-"
-      end
-  end
-end
--- ==================== eMMC 优化显示补丁结束 ====================
 d = m:section(Table, disks, translate("Disks"))
 d.config = "disk"
 -- option(type, id(key of table), text)
@@ -122,39 +43,8 @@ d:option(DummyValue, "temp", translate("Temp"))
 d:option(DummyValue, "p_table", translate("Partition Table"))
 d:option(DummyValue, "sata_ver", translate("SATA Version"))
 -- d:option(DummyValue, "rota_rate", translate("Rotation Rate"))
-d:option(DummyValue, "health_status", translate("Health") .. "<br/>" .. translate("Status"))
--- d:option(DummyValue, "status", translate("Status"))
-
--- local btn_eject = d:option(Button, "_eject")
--- btn_eject.template = "diskman/cbi/disabled_button"
--- btn_eject.inputstyle = "remove"
--- btn_eject.inputtitle = translate("Eject")
--- btn_eject.forcewrite = true
--- btn_eject.write = function(self, section, value)
---   local dev = section
---   local disk_info = dm.get_disk_info(dev, true)
---  if disk_info.p_table:match("Raid") or disk_info.model:match("MMC") then
---    m.errmessage = translate("Unsupported raid and MMC reject!")
---     return
---   end
---   for i, p in ipairs(disk_info.partitions) do
---     if p.mount_point ~= "-" then
---       m.errmessage = p.name .. translate("is in use! please unmount it first!")
---       return
---     end
---   end
---   if disk_info.type:match("md") then
---     luci.util.exec(dm.command.mdadm .. " --stop /dev/" .. dev)
---     luci.util.exec(dm.command.mdadm .. " --remove /dev/" .. dev)
---     for _, disk in ipairs(disk_info.members) do
---       luci.util.exec(dm.command.mdadm .. " --zero-superblock " .. disk)
---     end
---     dm.gen_mdadm_config()
---   else
---     luci.util.exec("echo 1 > /sys/block/" .. dev .. "/device/delete")
---   end
---   luci.http.redirect(luci.dispatcher.build_url("admin/system/diskman"))
--- end
+d:option(DummyValue, "health", translate("Health"))
+d:option(DummyValue, "status", translate("Status"))
 
 d.extedit = luci.dispatcher.build_url("admin/system/diskman/partition/%s")
 
@@ -327,28 +217,26 @@ if dm.command.mdadm then
 
   local rname, rmembers, rlevel
   local r_name = creation_section:taboption("raid", Value, "_rname", translate("Raid Name"))
-  r_name.placeholder = dm.find_free_md_device()
+  r_name.placeholder = "/dev/md0"
   r_name.write = function(self, section, value)
     rname = value
   end
   local r_level = creation_section:taboption("raid", ListValue, "_rlevel", translate("Raid Level"))
-  local valid_raid = luci.util.exec("grep -m1 'Personalities :' /proc/mdstat")
-  if valid_raid:match("%[linear%]") then
+  local valid_raid = luci.util.exec("lsmod | grep md_mod")
+  if valid_raid:match("linear") then
     r_level:value("linear", "Linear")
   end
-  if valid_raid:match("%[raid5%]") then
+  if valid_raid:match("raid456") then
     r_level:value("5", "Raid 5")
-  end
-  if valid_raid:match("%[raid6%]") then
     r_level:value("6", "Raid 6")
   end
-  if valid_raid:match("%[raid1%]") then
+  if valid_raid:match("raid1") then
     r_level:value("1", "Raid 1")
   end
-  if valid_raid:match("%[raid0%]") then
+  if valid_raid:match("raid0") then
     r_level:value("0", "Raid 0")
   end
-  if valid_raid:match("%[raid10%]") then
+  if valid_raid:match("raid10") then
     r_level:value("10", "Raid 10")
   end
   r_level.write = function(self, section, value)
