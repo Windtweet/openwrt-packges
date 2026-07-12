@@ -6,7 +6,7 @@
 include $(TOPDIR)/rules.mk
 include $(INCLUDE_DIR)/kernel.mk
 
-PKG_NAME:=r8152
+PKG_NAME:=r8152-windtweet
 PKG_VERSION:=2.21.4
 PKG_RELEASE:=1
 
@@ -21,7 +21,7 @@ include $(INCLUDE_DIR)/package.mk
 
 define KernelPackage/r8152
   SUBMENU:=Network Devices
-  TITLE:=Realtek RTL815X USB Ethernet driver
+  TITLE:=Realtek RTL815X USB Ethernet driver Windtweet
   DEPENDS:=+kmod-usb-net +kmod-libphy
   FILES:=$(PKG_BUILD_DIR)/r8152.ko
   AUTOLOAD:=$(call AutoProbe,r8152)

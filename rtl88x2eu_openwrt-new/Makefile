@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 include $(INCLUDE_DIR)/kernel.mk
 
-PKG_NAME:=rtl88x2eu
+PKG_NAME:=rtl88x2eu-windtweet
 # 重点1：版本号需与驱动实际版本一致
 PKG_VERSION:=5.15.182_30362
 PKG_RELEASE:=1
@@ -23,7 +23,7 @@ include $(INCLUDE_DIR)/package.mk
 # 重点5：内核模块包定义
 define KernelPackage/rtl88x2eu
   SUBMENU:=Wireless Drivers
-  TITLE:=Realtek RTL88X2EU Wireless Driver
+  TITLE:=Realtek RTL88X2EU Wireless Driver Windtweet
   # 重点6：依赖关系
   DEPENDS:=+kmod-cfg80211 +kmod-usb-core +@DRIVER_11N_SUPPORT +@DRIVER_11AC_SUPPORT
   # 重点7：指定生成的模块文件路径
