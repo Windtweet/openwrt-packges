@@ -1,0 +1,15 @@
+kernel:5.15.182
+backports:6.1.110
+drivers:5.15
+
+修改的文件：
+1、ioctl_cfg80211.c
+516行改为cfg80211_ch_switch_started_notify(adapter->pnetdev, &chdef, 0, 0, false);
+535行改为cfg80211_ch_switch_notify(adapter->pnetdev, &chdef, 0, punct_bitmap);
+2、os_intfs.c
+2269行改为netif_napi_add(ndev, &adapter->napi, rtw_recv_napi_poll);
+
+4、wifi_regd.c
+
+675行改为wiphy->regulatory_flags |= REGULATORY_DISABLE_BEACON_HINTS;
+5、删除./include/linux/wireless.h
